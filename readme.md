@@ -4,6 +4,7 @@
 **TVCast** 是一个轻量级、高性能的 Windows 电视投屏工具。它基于标准 DLNA 协议，允许用户将电脑端的本地视频文件或实时桌面镜像一键投射到智能电视、投影仪或电视盒子上。
 
 本项目特别针对旧设备和系统进行了优化，采用winform framework4.8框架，**最低支持 Windows 7 32位 (x86) 版本**，并采用了[**AntdUI**](https://github.com/AntdUI/AntdUI) 界面库，兼顾了极致的兼容性与美观的交互体验。
+<img width="741" height="507" alt="截图" src="https://github.com/user-attachments/assets/3cf40974-446a-43ad-9cd0-2282323ddef7" />
 
 ---
 **特别说明：** 本项目核心技术大部分为AI生成
@@ -72,5 +73,6 @@
 
 * **[AntdUI](https://github.com/AntdUI/AntdUI)**: 基于 **Apache License 2.0** 协议开源。
 * 本项目在遵循 GPLv3 的前提下，完全保留并尊重第三方组件的原有协议。
+
 
 有关协议的详细内容，请参阅项目根目录下的 [LICENSE](./LICENSE) 文件。
