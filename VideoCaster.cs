@@ -370,8 +370,13 @@ namespace TVCast
                 try
                 {
                     var client = await _listener.AcceptTcpClientAsync();
-                    client.NoDelay = true;
-                    client.SendBufferSize = 64 * 1024;
+
+                    // 低延迟 TCP 配置
+                    client.NoDelay = true; // 禁用 Nagle 算法
+                    client.SendBufferSize = 32 * 1024; // 降低发送缓冲区以减少延迟
+                    client.ReceiveBufferSize = 8 * 1024; // 接收缓冲区可以较小
+                    client.SendTimeout = 5000;
+                    client.LingerState = new System.Net.Sockets.LingerOption(false, 0);
 
                     // 每次新连接，重置推流管道
                     ResetPipeline();
@@ -393,12 +398,19 @@ namespace TVCast
                     byte[] buffer = new byte[1024];
                     if (stream.Read(buffer, 0, buffer.Length) == 0) return;
 
-                    // 发送 TS 流头部
-                    string headers = "HTTP/1.1 200 OK\r\nContent-Type: video/mpeg\r\nConnection: close\r\n" +
+                    // 发送 TS 流头部 - 优化低延迟参数
+                    string headers = "HTTP/1.1 200 OK\r\n" +
+                                     "Content-Type: video/mpeg\r\n" +
+                                     "Connection: close\r\n" +
+                                     "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
+                                     "Pragma: no-cache\r\n" +
+                                     "Expires: 0\r\n" +
+                                     "X-Content-Duration: 0\r\n" +
                                      "transferMode.dlna.org: Streaming\r\n" +
-                                     "contentFeatures.dlna.org: DLNA.ORG_PN=MPEG_TS_SD_EU_ISO;DLNA.ORG_OP=10;DLNA.ORG_CI=1\r\n\r\n";
+                                     "contentFeatures.dlna.org: DLNA.ORG_PN=MPEG_TS_SD_EU_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n\r\n";
                     byte[] hBytes = Encoding.ASCII.GetBytes(headers);
                     stream.Write(hBytes, 0, hBytes.Length);
+                    stream.Flush(); // 立即发送响应头
 
                     StartFFmpegPipeline(stream);
                 }
@@ -410,8 +422,29 @@ namespace TVCast
         private void StartFFmpegPipeline(Stream clientStream)
         {
             var bounds = System.Windows.Forms.Screen.PrimaryScreen.Bounds;
-            int w = bounds.Width % 2 == 0 ? bounds.Width : bounds.Width - 1;
-            int h = bounds.Height % 2 == 0 ? bounds.Height : bounds.Height - 1;
+
+            // 自适应分辨率：高分辨率降级到 720p 以减少编码和网络负担
+            int captureWidth, captureHeight;
+            if (bounds.Width > 1920 || bounds.Height > 1080)
+            {
+                // 4K/2K 降到 720p
+                captureWidth = 1280;
+                captureHeight = 720;
+                Debug.WriteLine($"[TVCast] Downscaling from {bounds.Width}x{bounds.Height} to 720p for better performance");
+            }
+            else if (bounds.Width > 1280)
+            {
+                // 1080p 降到 720p
+                captureWidth = 1280;
+                captureHeight = 720;
+                Debug.WriteLine($"[TVCast] Downscaling from {bounds.Width}x{bounds.Height} to 720p");
+            }
+            else
+            {
+                // 720p 及以下保持原始分辨率
+                captureWidth = bounds.Width % 2 == 0 ? bounds.Width : bounds.Width - 1;
+                captureHeight = bounds.Height % 2 == 0 ? bounds.Height : bounds.Height - 1;
+            }
 
             using (var vServer = new NamedPipeServerStream(_videoPipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous))
             using (var aServer = _audioCapturer != null ? new NamedPipeServerStream(_audioPipeName, PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous) : null)
@@ -420,7 +453,10 @@ namespace TVCast
                 var ffmpegArgs = HardwareCapabilityDetector.BuildFFmpegArgs(
                     $@"\\.\pipe\{_videoPipeName}",
                     $@"\\.\pipe\{_audioPipeName}",
-                    w, h, _audioCapturer != null);
+                    captureWidth, captureHeight, _audioCapturer != null);
+
+                Debug.WriteLine($"[TVCast] Starting FFmpeg {captureWidth}x{captureHeight} with audio: {_audioCapturer != null}");
+                Debug.WriteLine($"[TVCast] FFmpeg args: {ffmpegArgs}");
 
                 var proc = new Process
                 {
@@ -442,28 +478,60 @@ namespace TVCast
 
                 // 等待管道连接 (超时保护)
                 var vTask = Task.Factory.FromAsync(vServer.BeginWaitForConnection, vServer.EndWaitForConnection, null);
-                if (!vTask.Wait(3000)) { proc.Kill(); return; }
+                if (!vTask.Wait(3000))
+                {
+                    Debug.WriteLine("[TVCast] Video pipe connection timeout");
+                    proc.Kill();
+                    return;
+                }
 
                 if (aServer != null)
                 {
                     var aTask = Task.Factory.FromAsync(aServer.BeginWaitForConnection, aServer.EndWaitForConnection, null);
-                    aTask.Wait(1000); // 音频非关键
+                    if (!aTask.Wait(1000))
+                    {
+                        Debug.WriteLine("[TVCast] Audio pipe connection timeout (non-critical)");
+                    }
                 }
 
-                // 启动采集器
+                // 启动采集器（直接以目标分辨率采集）
                 try
                 {
                     _videoCapturer = new DirectXScreenCapturer();
-                    _videoCapturer.Start(w, h, vServer);
+                    _videoCapturer.Start(captureWidth, captureHeight, vServer);
+                    Debug.WriteLine("[TVCast] DirectX screen capturer started successfully");
                 }
-                catch
+                catch (Exception ex)
                 {
-                    Debug.WriteLine("[TVCast] DirectX Failed, switching to GDI.");
-                    _videoCapturer = new GdiScreenCapturer();
-                    _videoCapturer.Start(w, h, vServer);
+                    Debug.WriteLine($"[TVCast] DirectX failed: {ex.Message}, switching to GDI.");
+                    try
+                    {
+                        _videoCapturer = new GdiScreenCapturer();
+                        _videoCapturer.Start(captureWidth, captureHeight, vServer);
+                        Debug.WriteLine("[TVCast] GDI screen capturer started successfully");
+                    }
+                    catch (Exception gdiEx)
+                    {
+                        Debug.WriteLine($"[TVCast] GDI fallback also failed: {gdiEx.Message}");
+                        proc.Kill();
+                        throw;
+                    }
                 }
 
-                _audioCapturer?.Start(aServer);
+                // 启动音频采集器 (如果启用)
+                if (_audioCapturer != null)
+                {
+                    try
+                    {
+                        _audioCapturer.Start(aServer);
+                        Debug.WriteLine("[TVCast] Audio capturer started successfully");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[TVCast] Audio capture failed (non-critical): {ex.Message}");
+                        // 音频失败不中断投屏,继续视频传输
+                    }
+                }
 
                 // 将 FFmpeg 输出转发给 TCP 客户端
                 try { proc.StandardOutput.BaseStream.CopyTo(clientStream); } catch { }
@@ -488,109 +556,231 @@ namespace TVCast
     {
         private Thread _thread;
         private volatile bool _running;
+        private Stream _outputStream;
+        private Exception _threadException;
 
         public void Start(int width, int height, Stream outputStream)
         {
+            _outputStream = outputStream;
+            _threadException = null;
+
+            // 同步验证 DirectX 是否可用（在主线程中抛出异常）
             var (adapter, output) = FindWorkingAdapter();
-            if (adapter == -1) throw new NotSupportedException("No DXGI adapter found.");
+            if (adapter == -1)
+            {
+                throw new NotSupportedException("No DXGI adapter found.");
+            }
+
+            // 尝试同步创建设备以确保真正可用
+            try
+            {
+                TestDeviceCreation(adapter, output);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[DirectX] Device test failed: {ex.Message}");
+                throw new NotSupportedException("DirectX device creation failed", ex);
+            }
 
             _running = true;
             _thread = new Thread(() => CaptureLoop(outputStream, width, height, adapter, output))
             {
-                Priority = ThreadPriority.AboveNormal
+                Priority = ThreadPriority.AboveNormal,
+                IsBackground = true // 标记为后台线程，避免阻止进程退出
             };
             _thread.Start();
+
+            // 等待一小段时间检查线程是否因异常立即退出
+            Thread.Sleep(50);
+            if (_threadException != null)
+            {
+                throw new NotSupportedException("DirectX capture failed to start", _threadException);
+            }
         }
 
         public void Stop()
         {
             _running = false;
-            _thread?.Join(200);
+
+            // 关闭流以解除阻塞的写入操作
+            try { _outputStream?.Close(); } catch { }
+
+            // 等待线程结束，增加超时时间
+            if (_thread != null && _thread.IsAlive)
+            {
+                if (!_thread.Join(500))
+                {
+                    Debug.WriteLine("[DirectX] Thread did not exit gracefully, aborting");
+                    try { _thread.Abort(); } catch { }
+                }
+            }
+        }
+
+        private void TestDeviceCreation(int adapterIdx, int outputIdx)
+        {
+            var featureLevels = new[]
+            {
+                SharpDX.Direct3D.FeatureLevel.Level_11_0,
+                SharpDX.Direct3D.FeatureLevel.Level_10_1,
+                SharpDX.Direct3D.FeatureLevel.Level_10_0,
+                SharpDX.Direct3D.FeatureLevel.Level_9_3
+            };
+
+            using (var factory = new Factory1())
+            using (var adapter = factory.GetAdapter1(adapterIdx))
+            using (var device = new SharpDX.Direct3D11.Device(adapter,
+                SharpDX.Direct3D11.DeviceCreationFlags.BgraSupport,
+                featureLevels))
+            using (var output = adapter.GetOutput(outputIdx))
+            using (var output1 = output.QueryInterface<Output1>())
+            using (var dup = output1.DuplicateOutput(device))
+            {
+                // 测试成功
+            }
         }
 
         private (int, int) FindWorkingAdapter()
         {
+            // 定义支持的 Feature Levels,从高到低尝试
+            var featureLevels = new[]
+            {
+                SharpDX.Direct3D.FeatureLevel.Level_11_0,
+                SharpDX.Direct3D.FeatureLevel.Level_10_1,
+                SharpDX.Direct3D.FeatureLevel.Level_10_0,
+                SharpDX.Direct3D.FeatureLevel.Level_9_3
+            };
+
             using (var factory = new Factory1())
             {
                 for (int i = 0; i < factory.Adapters1.Length; i++)
                 {
                     using (var a = factory.GetAdapter1(i))
                     {
-                        if (a.Description.Description.Contains("Basic Render")) continue;
+                        // 跳过软件渲染器
+                        if (a.Description.Description.Contains("Basic Render") ||
+                            a.Description.Description.Contains("Microsoft Basic"))
+                            continue;
+
                         for (int j = 0; j < a.GetOutputCount(); j++)
                         {
                             try
                             {
-                                using (var d = new SharpDX.Direct3D11.Device(a))
+                                // 使用 DriverType.Unknown 并指定 Adapter + Feature Levels
+                                using (var d = new SharpDX.Direct3D11.Device(a,
+                                    SharpDX.Direct3D11.DeviceCreationFlags.BgraSupport,
+                                    featureLevels))
                                 using (var o = a.GetOutput(j))
                                 using (var o1 = o.QueryInterface<Output1>())
-                                using (var dup = o1.DuplicateOutput(d)) return (i, j);
+                                using (var dup = o1.DuplicateOutput(d))
+                                {
+                                    Debug.WriteLine($"[DirectX] Using Adapter {i}, Output {j}: {a.Description.Description}");
+                                    return (i, j);
+                                }
                             }
-                            catch { }
+                            catch (SharpDXException ex)
+                            {
+                                Debug.WriteLine($"[DirectX] Adapter {i} Output {j} failed: {ex.ResultCode} - {ex.Message}");
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"[DirectX] Adapter {i} Output {j} error: {ex.GetType().Name}");
+                            }
                         }
                     }
                 }
             }
+            Debug.WriteLine("[DirectX] No compatible DXGI adapter found, will use GDI fallback.");
             return (-1, -1);
         }
 
         private void CaptureLoop(Stream stream, int w, int h, int adapterIdx, int outputIdx)
         {
-            using (var factory = new Factory1())
-            using (var adapter = factory.GetAdapter1(adapterIdx))
-            using (var device = new SharpDX.Direct3D11.Device(adapter))
-            using (var output = adapter.GetOutput(outputIdx))
-            using (var output1 = output.QueryInterface<Output1>())
-            using (var duplicatedOutput = output1.DuplicateOutput(device))
+            var featureLevels = new[]
             {
-                Texture2D stagingTexture = null;
-                byte[] lineBuff = new byte[w * 4];
+                SharpDX.Direct3D.FeatureLevel.Level_11_0,
+                SharpDX.Direct3D.FeatureLevel.Level_10_1,
+                SharpDX.Direct3D.FeatureLevel.Level_10_0,
+                SharpDX.Direct3D.FeatureLevel.Level_9_3
+            };
 
-                while (_running)
+            try
+            {
+                using (var factory = new Factory1())
+                using (var adapter = factory.GetAdapter1(adapterIdx))
+                using (var device = new SharpDX.Direct3D11.Device(adapter,
+                    SharpDX.Direct3D11.DeviceCreationFlags.BgraSupport,
+                    featureLevels))
+                using (var output = adapter.GetOutput(outputIdx))
+                using (var output1 = output.QueryInterface<Output1>())
+                using (var duplicatedOutput = output1.DuplicateOutput(device))
                 {
-                    try
-                    {
-                        var res = duplicatedOutput.TryAcquireNextFrame(20, out _, out var screenRes);
-                        if (res.Success)
-                        {
-                            using (var screenTex = screenRes.QueryInterface<Texture2D>())
-                            {
-                                if (stagingTexture == null)
-                                {
-                                    var desc = screenTex.Description;
-                                    desc.CpuAccessFlags = CpuAccessFlags.Read;
-                                    desc.Usage = ResourceUsage.Staging;
-                                    desc.BindFlags = BindFlags.None;
-                                    desc.OptionFlags = ResourceOptionFlags.None;
-                                    stagingTexture = new Texture2D(device, desc);
-                                }
-                                device.ImmediateContext.CopyResource(screenTex, stagingTexture);
-                            }
-                            screenRes.Dispose();
-                            duplicatedOutput.ReleaseFrame();
+                    Texture2D stagingTexture = null;
+                    byte[] lineBuff = new byte[w * 4];
 
-                            var map = device.ImmediateContext.MapSubresource(stagingTexture, 0, MapMode.Read, MapFlags.None);
-                            try
+                    while (_running)
+                    {
+                        try
+                        {
+                            var res = duplicatedOutput.TryAcquireNextFrame(20, out _, out var screenRes);
+                            if (res.Success)
                             {
-                                if (!stream.CanWrite) break;
-                                IntPtr ptr = map.DataPointer;
-                                for (int y = 0; y < h; y++)
+                                using (var screenTex = screenRes.QueryInterface<Texture2D>())
                                 {
-                                    Marshal.Copy(ptr, lineBuff, 0, lineBuff.Length);
-                                    stream.Write(lineBuff, 0, lineBuff.Length);
-                                    ptr = IntPtr.Add(ptr, map.RowPitch);
+                                    if (stagingTexture == null)
+                                    {
+                                        var desc = screenTex.Description;
+                                        desc.CpuAccessFlags = CpuAccessFlags.Read;
+                                        desc.Usage = ResourceUsage.Staging;
+                                        desc.BindFlags = BindFlags.None;
+                                        desc.OptionFlags = ResourceOptionFlags.None;
+                                        stagingTexture = new Texture2D(device, desc);
+                                    }
+                                    device.ImmediateContext.CopyResource(screenTex, stagingTexture);
                                 }
+                                screenRes.Dispose();
+                                duplicatedOutput.ReleaseFrame();
+
+                                var map = device.ImmediateContext.MapSubresource(stagingTexture, 0, MapMode.Read, MapFlags.None);
+                                try
+                                {
+                                    if (!stream.CanWrite) break;
+                                    IntPtr ptr = map.DataPointer;
+                                    for (int y = 0; y < h; y++)
+                                    {
+                                        Marshal.Copy(ptr, lineBuff, 0, lineBuff.Length);
+                                        stream.Write(lineBuff, 0, lineBuff.Length);
+                                        ptr = IntPtr.Add(ptr, map.RowPitch);
+                                    }
+                                }
+                                finally { device.ImmediateContext.UnmapSubresource(stagingTexture, 0); }
                             }
-                            finally { device.ImmediateContext.UnmapSubresource(stagingTexture, 0); }
+                        }
+                        catch (SharpDXException e)
+                        {
+                            if (e.ResultCode == SharpDX.DXGI.ResultCode.AccessLost)
+                            {
+                                Debug.WriteLine("[DirectX] AccessLost - GPU reset detected");
+                                break;
+                            }
+                        }
+                        catch (IOException)
+                        {
+                            // 流已关闭，正常退出
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[DirectX] Frame capture error: {ex.Message}");
+                            break;
                         }
                     }
-                    catch (SharpDXException e)
-                    {
-                        if (e.ResultCode == SharpDX.DXGI.ResultCode.AccessLost) break; // 显卡重置，退出重试
-                    }
-                    catch { break; } // 管道断开
+                    stagingTexture?.Dispose();
                 }
-                stagingTexture?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _threadException = ex;
+                Debug.WriteLine($"[DirectX] CaptureLoop failed: {ex.GetType().Name} - {ex.Message}");
             }
         }
     }
@@ -602,44 +792,112 @@ namespace TVCast
     {
         private Thread _thread;
         private volatile bool _running;
+        private Stream _outputStream;
 
         public void Start(int width, int height, Stream outputStream)
         {
+            _outputStream = outputStream;
             _running = true;
-            _thread = new Thread(() => CaptureLoop(outputStream, width, height));
+            _thread = new Thread(() => CaptureLoop(outputStream, width, height))
+            {
+                IsBackground = true
+            };
             _thread.Start();
         }
 
         public void Stop()
         {
             _running = false;
-            _thread?.Join(200);
+
+            // 关闭流以解除阻塞的写入操作
+            try { _outputStream?.Close(); } catch { }
+
+            // 等待线程结束
+            if (_thread != null && _thread.IsAlive)
+            {
+                if (!_thread.Join(500))
+                {
+                    Debug.WriteLine("[GDI] Thread did not exit gracefully, aborting");
+                    try { _thread.Abort(); } catch { }
+                }
+            }
         }
 
-        private void CaptureLoop(Stream stream, int w, int h)
+        private void CaptureLoop(Stream stream, int targetW, int targetH)
         {
-            byte[] buffer = new byte[w * h * 4];
+            var bounds = System.Windows.Forms.Screen.PrimaryScreen.Bounds;
+            bool needsScaling = (targetW != bounds.Width || targetH != bounds.Height);
+
+            byte[] buffer = new byte[targetW * targetH * 4];
             var interval = TimeSpan.FromMilliseconds(33); // 30 FPS
+
+            Debug.WriteLine($"[GDI] Capturing at {bounds.Width}x{bounds.Height}, output {targetW}x{targetH}, scaling: {needsScaling}");
 
             while (_running && stream.CanWrite)
             {
                 var sw = Stopwatch.StartNew();
                 try
                 {
-                    using (var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb))
+                    if (needsScaling)
                     {
-                        using (var g = Graphics.FromImage(bmp))
-                            g.CopyFromScreen(0, 0, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+                        // 需要缩放：先捕获全屏，再缩放
+                        using (var fullBmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppPArgb))
+                        using (var scaledBmp = new Bitmap(targetW, targetH, PixelFormat.Format32bppPArgb))
+                        {
+                            // 捕获全屏
+                            using (var g1 = Graphics.FromImage(fullBmp))
+                            {
+                                g1.CopyFromScreen(0, 0, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
+                            }
 
-                        var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
-                        Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
-                        bmp.UnlockBits(data);
+                            // 缩放到目标大小
+                            using (var g2 = Graphics.FromImage(scaledBmp))
+                            {
+                                g2.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Low;
+                                g2.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighSpeed;
+                                g2.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighSpeed;
+                                g2.DrawImage(fullBmp, 0, 0, targetW, targetH);
+                            }
+
+                            var data = scaledBmp.LockBits(new Rectangle(0, 0, targetW, targetH), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+                            Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
+                            scaledBmp.UnlockBits(data);
+                        }
                     }
+                    else
+                    {
+                        // 不需要缩放：直接捕获
+                        using (var bmp = new Bitmap(targetW, targetH, PixelFormat.Format32bppPArgb))
+                        {
+                            using (var g = Graphics.FromImage(bmp))
+                            {
+                                g.CopyFromScreen(0, 0, 0, 0, new Size(targetW, targetH), CopyPixelOperation.SourceCopy);
+                            }
+
+                            var data = bmp.LockBits(new Rectangle(0, 0, targetW, targetH), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+                            Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
+                            bmp.UnlockBits(data);
+                        }
+                    }
+
                     stream.Write(buffer, 0, buffer.Length);
                 }
-                catch { break; }
+                catch (IOException)
+                {
+                    // 流已关闭，正常退出
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[GDI] Capture error: {ex.Message}");
+                    break;
+                }
 
-                if (sw.Elapsed < interval) Thread.Sleep(interval - sw.Elapsed);
+                if (sw.Elapsed < interval)
+                {
+                    try { Thread.Sleep(interval - sw.Elapsed); }
+                    catch (ThreadAbortException) { break; }
+                }
             }
         }
     }
@@ -651,19 +909,54 @@ namespace TVCast
     {
         private WasapiLoopbackCapture _capture;
         private Stream _output;
+        private volatile bool _running;
 
         public void Start(Stream output)
         {
             _output = output;
-            _capture = new WasapiLoopbackCapture();
-            _capture.DataAvailable += (s, e) =>
+            _running = true;
+
+            try
             {
-                if (_output == null || !_output.CanWrite) return;
+                _capture = new WasapiLoopbackCapture();
+                _capture.DataAvailable += OnDataAvailable;
+                _capture.RecordingStopped += (s, e) =>
+                {
+                    if (e.Exception != null)
+                    {
+                        Debug.WriteLine($"[Audio] Recording stopped with error: {e.Exception.Message}");
+                    }
+                };
+                _capture.StartRecording();
+                Debug.WriteLine("[Audio] WASAPI loopback capture started");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] Failed to start capture: {ex.Message}");
+                throw;
+            }
+        }
+
+        private void OnDataAvailable(object sender, WaveInEventArgs e)
+        {
+            if (!_running || _output == null || !_output.CanWrite) return;
+
+            try
+            {
                 // 将 Float32 转换为 PCM16 以匹配 FFmpeg 输入
                 byte[] pcm16 = ConvertFloat32ToPcm16(e.Buffer, e.BytesRecorded);
-                try { _output.Write(pcm16, 0, pcm16.Length); } catch { Stop(); }
-            };
-            _capture.StartRecording();
+                _output.Write(pcm16, 0, pcm16.Length);
+            }
+            catch (IOException)
+            {
+                // 流已关闭，正常停止
+                _running = false;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] Write error: {ex.Message}");
+                _running = false;
+            }
         }
 
         private byte[] ConvertFloat32ToPcm16(byte[] buffer, int bytes)
@@ -682,10 +975,24 @@ namespace TVCast
 
         public void Stop()
         {
-            _capture?.StopRecording();
-            _capture?.Dispose();
-            _capture = null;
-            _output?.Close();
+            _running = false;
+
+            try
+            {
+                if (_capture != null)
+                {
+                    _capture.StopRecording();
+                    _capture.Dispose();
+                    _capture = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] Error stopping capture: {ex.Message}");
+            }
+
+            try { _output?.Close(); } catch { }
+            _output = null;
         }
     }
     #endregion
@@ -714,17 +1021,40 @@ namespace TVCast
 
         public static string BuildFFmpegArgs(string vPipe, string aPipe, int w, int h, bool hasAudio)
         {
-            string vInput = $"-f rawvideo -pixel_format bgra -video_size {w}x{h} -framerate 25 -i \"{vPipe}\"";
-            string aInput = hasAudio ? $"-f s16le -ac 2 -ar 48000 -i \"{aPipe}\"" : "";
+            // 输入参数：降低延迟的关键配置
+            string vInput = $"-probesize 32 -analyzeduration 0 -fflags nobuffer " +
+                           $"-f rawvideo -pixel_format bgra -video_size {w}x{h} -framerate 30 -i \"{vPipe}\"";
 
-            // 编码设置：低延迟优化
-            string enc = IsNVENCSupported()
-                ? "-c:v h264_nvenc -preset p1 -tune ll -rc vbr -cq 23 -b:v 2500k -maxrate 3500k -bufsize 7000k -zerolatency 1"
-                : "-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -b:v 2000k -bufsize 4000k";
+            string aInput = hasAudio
+                ? $"-probesize 32 -analyzeduration 0 -f s16le -ac 2 -ar 48000 -i \"{aPipe}\""
+                : "";
 
-            string aEnc = hasAudio ? "-c:a aac -b:a 128k -ac 2" : "";
+            // 视频编码：极致低延迟优化
+            string enc;
+            if (IsNVENCSupported())
+            {
+                // NVIDIA 硬件编码：降低缓冲区和比特率
+                enc = "-c:v h264_nvenc -preset p1 -tune ll -rc cbr -b:v 2000k -maxrate 2000k -bufsize 500k " +
+                      "-zerolatency 1 -delay 0 -g 30 -bf 0 -forced-idr 1";
+            }
+            else
+            {
+                // CPU 编码：超低延迟配置
+                enc = "-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p " +
+                      "-b:v 1500k -maxrate 1500k -bufsize 300k -g 30 -bf 0 -x264opts no-scenecut:rc-lookahead=0";
+            }
 
-            return $"-hide_banner -loglevel error {vInput} {aInput} -map 0:v {(hasAudio ? "-map 1:a" : "")} {enc} {aEnc} -f mpegts -flush_packets 1 -";
+            // 音频编码：低延迟 AAC
+            string aEnc = hasAudio ? "-c:a aac -b:a 96k -ac 2 -ar 48000" : "";
+
+            // 输出参数：MPEG-TS 低延迟封装
+            string output = "-f mpegts -mpegts_flags +initial_discontinuity " +
+                           "-flush_packets 1 -fflags +flush_packets+nobuffer " +
+                           "-max_delay 0 -muxdelay 0.001 -";
+
+            return $"-hide_banner -loglevel error {vInput} {aInput} " +
+                   $"-map 0:v {(hasAudio ? "-map 1:a" : "")} " +
+                   $"{enc} {aEnc} {output}";
         }
     }
 

@@ -212,11 +212,13 @@ namespace TVCast
                 using (var client = new HttpClient())
                 {
                     client.DefaultRequestHeaders.Add("User-Agent", "TVCast-DLNA/1.0");
-                    client.Timeout = TimeSpan.FromSeconds(3); // 快速超时避免阻塞
+
                     var resp = await client.GetAsync(url);
                     resp.EnsureSuccessStatusCode();
 
-                    var xmlString = await resp.Content.ReadAsStringAsync();
+                    var bytes = await resp.Content.ReadAsByteArrayAsync();
+                    var xmlString = Encoding.UTF8.GetString(bytes);
+
                     var doc = new XmlDocument();
                     doc.LoadXml(xmlString);
                     return doc;
